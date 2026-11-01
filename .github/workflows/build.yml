@@ -15,7 +15,7 @@ jobs:
       - name: Build with MinGW GCC
         run: |
           gcc -O2 -o tinyntp.exe tinyntp.c -lws2_32 -s
-          ls -la tinyntp.exe
+          Get-ChildItem tinyntp.exe | Select-Object Name, Length
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
