@@ -1,15 +1,6 @@
 /*
  * tinyntp - Windows System Time Calibration Tool
- *
- * Fetches standard time from public time servers and calibrates
- * the local system clock.
- *
- * Features:
- *   - Query public time servers for standard time
- *   - Show time difference between system and standard time
- *   - Optional auto-calibration (requires admin privileges)
- *
- * Version: 1.0.0
+ * v1.0.1 - China optimized, slim build
  */
 
 #include <winsock2.h>
@@ -20,242 +11,135 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-/* Protocol constants */
-#define TIME_PROTO_PORT 123
-#define TIME_EPOCH_DELTA 2208988800ULL
-#define DEFAULT_TIME_SERVER "time.windows.com"
-#define MAX_SERVER_NAME_LEN 256
+#define NTP_PORT 123
+#define NTP_DELTA 2208988800ULL
+#define TIMEOUT_MS 8000
 
-/* Time protocol packet structure (48 bytes) */
+/* Built-in server list, try in order */
+static const char *servers[] = {
+    "ntp.aliyun.com",
+    "cn.ntp.org.cn",
+    "time.windows.com",
+    NULL
+};
+
 typedef struct {
     BYTE flags;
     BYTE stratum;
-    BYTE poll_interval;
+    BYTE poll;
     BYTE precision;
     DWORD root_delay;
-    DWORD root_dispersion;
-    DWORD reference_id;
-    DWORD ref_time_sec;
-    DWORD ref_time_frac;
-    DWORD orig_time_sec;
-    DWORD orig_time_frac;
-    DWORD recv_time_sec;
-    DWORD recv_time_frac;
-    DWORD trans_time_sec;
-    DWORD trans_time_frac;
-} time_packet;
+    DWORD root_disp;
+    DWORD ref_id;
+    DWORD ref_s, ref_f;
+    DWORD orig_s, orig_f;
+    DWORD rx_s, rx_f;
+    DWORD tx_s, tx_f;
+} ntp_pkt;
 
-/* Built-in time server list */
-typedef struct {
-    const char *name;
-    const char *description;
-} time_server;
-
-static time_server server_list[] = {
-    { "time.windows.com", "Microsoft official time server" },
-    { "ntp.aliyun.com",   "Alibaba Cloud public time server" },
-    { "cn.ntp.org.cn",    "China national time server" },
-    { "pool.ntp.org",     "Global public time pool" },
-    { NULL, NULL }
-};
-
-static void print_banner(void) {
-    printf("========================================\n");
-    printf("   Windows System Time Calibration v1.0\n");
-    printf("   Fetch standard time from public servers\n");
-    printf("========================================\n");
-    printf("\n");
+static int init_net(void) {
+    WSADATA w;
+    return WSAStartup(MAKEWORD(2,2), &w);
 }
 
-static void print_help(const char *prog_name) {
-    print_banner();
-    printf("Usage: %s [OPTIONS]\n", prog_name);
-    printf("\nOptions:\n");
-    printf("  (no args)    Query and show time difference using default server\n");
-    printf("  -s SERVER    Specify time server address\n");
-    printf("  -l           List all available time servers\n");
-    printf("  -c           Auto-calibrate system time (requires admin)\n");
-    printf("  -h           Show this help message\n");
-    printf("\nExamples:\n");
-    printf("  %s                    # Query and show difference\n", prog_name);
-    printf("  %s -s ntp.aliyun.com  # Use Alibaba Cloud server\n", prog_name);
-    printf("  %s -c                 # Auto-calibrate system time\n", prog_name);
-    printf("\nNote: Auto-calibrate requires Administrator privileges.\n");
-}
+static time_t query_server(const char *host) {
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return -1;
 
-static void list_servers(void) {
-    printf("Available time servers:\n");
-    printf("\n");
-    int i = 0;
-    while (server_list[i].name != NULL) {
-        printf("  %-25s  %s\n", server_list[i].name, server_list[i].description);
-        i++;
-    }
-    printf("\n");
-}
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&(DWORD){TIMEOUT_MS}, sizeof(DWORD));
 
-static int init_winsock(void) {
-    WSADATA wsa_data;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
-        printf("Error: Network initialization failed\n");
-        return -1;
-    }
-    return 0;
-}
+    struct hostent *he = gethostbyname(host);
+    if (!he) { closesocket(s); return -1; }
 
-static void cleanup_winsock(void) {
-    WSACleanup();
-}
+    struct sockaddr_in addr;
+    ZeroMemory(&addr, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(NTP_PORT);
+    memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
 
-/* Fetch standard time from server. Returns time_t, -1 on failure. */
-static time_t fetch_standard_time(const char *server_name) {
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) {
-        printf("Error: Cannot create network socket\n");
-        return -1;
-    }
+    ntp_pkt pkt;
+    ZeroMemory(&pkt, sizeof(pkt));
+    pkt.flags = 0x1B;
 
-    /* Set receive timeout to 5 seconds */
-    DWORD timeout = 5000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    sendto(s, (const char*)&pkt, sizeof(pkt), 0, (struct sockaddr*)&addr, sizeof(addr));
+    int n = recvfrom(s, (char*)&pkt, sizeof(pkt), 0, NULL, NULL);
+    closesocket(s);
 
-    /* Resolve server address */
-    struct hostent *he = gethostbyname(server_name);
-    if (he == NULL) {
-        printf("Error: Cannot resolve server: %s\n", server_name);
-        closesocket(sock);
-        return -1;
-    }
-
-    struct sockaddr_in server_addr;
-    ZeroMemory(&server_addr, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(TIME_PROTO_PORT);
-    memcpy(&server_addr.sin_addr, he->h_addr_list[0], he->h_length);
-
-    /* Build request packet */
-    time_packet packet;
-    ZeroMemory(&packet, sizeof(packet));
-    packet.flags = 0x1B;  /* Client mode */
-
-    /* Send request */
-    if (sendto(sock, (const char*)&packet, sizeof(packet), 0,
-               (struct sockaddr*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
-        printf("Error: Failed to send request\n");
-        closesocket(sock);
-        return -1;
-    }
-
-    /* Receive response */
-    int recv_len = recvfrom(sock, (char*)&packet, sizeof(packet), 0, NULL, NULL);
-    closesocket(sock);
-
-    if (recv_len == SOCKET_ERROR) {
-        printf("Error: Receive timeout or failed\n");
-        return -1;
-    }
-
-    /* Parse timestamp (big-endian to host) */
-    DWORD trans_sec = ntohl(packet.trans_time_sec);
-    time_t standard_time = (time_t)(trans_sec - TIME_EPOCH_DELTA);
-
-    return standard_time;
-}
-
-static void format_time(time_t t, char *buf, size_t buf_len) {
-    struct tm *tm_info = localtime(&t);
-    strftime(buf, buf_len, "%Y-%m-%d %H:%M:%S", tm_info);
+    if (n <= 0) return -1;
+    return (time_t)(ntohl(pkt.tx_s) - NTP_DELTA);
 }
 
 int main(int argc, char *argv[]) {
-    const char *server_name = DEFAULT_TIME_SERVER;
-    int do_calibrate = 0;
+    const char *custom = NULL;
+    int calibrate = 0;
 
-    /* Parse command line arguments */
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            print_help(argv[0]);
+        if (!strcmp(argv[i], "-h")) {
+            printf("tinyntp - Windows time calibration\n");
+            printf("Usage: tinyntp [-s server] [-c]\n");
+            printf("  -s SERVER   Use custom NTP server\n");
+            printf("  -c          Calibrate system time (needs admin)\n");
+            printf("  -h          Show this help\n");
             return 0;
-        } else if (strcmp(argv[i], "-l") == 0) {
-            print_banner();
-            list_servers();
-            return 0;
-        } else if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
-            server_name = argv[++i];
-        } else if (strcmp(argv[i], "-c") == 0) {
-            do_calibrate = 1;
+        } else if (!strcmp(argv[i], "-s") && i+1 < argc) {
+            custom = argv[++i];
+        } else if (!strcmp(argv[i], "-c")) {
+            calibrate = 1;
         }
     }
 
-    print_banner();
+    printf("tinyntp - Time Calibration Tool\n");
+    printf("================================\n\n");
 
-    printf("Connecting to time server: %s\n", server_name);
+    if (init_net() != 0) { printf("Network init failed\n"); return 1; }
 
-    if (init_winsock() != 0) {
-        return 1;
-    }
-
-    /* Get standard time */
-    time_t standard_time = fetch_standard_time(server_name);
-    if (standard_time == (time_t)-1) {
-        cleanup_winsock();
-        return 1;
-    }
-
-    cleanup_winsock();
-
-    /* Get local system time */
-    time_t local_time = time(NULL);
-
-    /* Format and display */
-    char time_buf[64];
-    format_time(standard_time, time_buf, sizeof(time_buf));
-    printf("Standard time: %s\n", time_buf);
-
-    format_time(local_time, time_buf, sizeof(time_buf));
-    printf("System time:   %s\n", time_buf);
-
-    /* Calculate time difference */
-    double diff = difftime(standard_time, local_time);
-    printf("\nTime difference: %.2f seconds", diff);
-    if (diff > 0) {
-        printf(" (system clock is slow by %.2f s)\n", diff);
-    } else if (diff < 0) {
-        printf(" (system clock is fast by %.2f s)\n", -diff);
+    time_t std_time = -1;
+    if (custom) {
+        printf("Querying: %s\n", custom);
+        std_time = query_server(custom);
+        if (std_time == -1) printf("Failed to reach %s\n", custom);
     } else {
-        printf("\n");
+        for (int i = 0; servers[i]; i++) {
+            printf("Trying: %s ... ", servers[i]);
+            std_time = query_server(servers[i]);
+            if (std_time != -1) { printf("OK\n"); break; }
+            printf("timeout\n");
+        }
     }
 
-    /* Auto calibrate if requested */
-    if (do_calibrate) {
-        printf("\nCalibrating system time...\n");
+    WSACleanup();
 
-        struct tm *tm_info = localtime(&standard_time);
+    if (std_time == -1) {
+        printf("\nAll servers failed. Try -s with a custom server.\n");
+        return 1;
+    }
+
+    time_t local = time(NULL);
+    double diff = difftime(std_time, local);
+
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&std_time));
+    printf("Standard: %s\n", buf);
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&local));
+    printf("System:   %s\n", buf);
+    printf("Diff: %.2fs\n", diff);
+
+    if (calibrate) {
+        printf("\nCalibrating...\n");
+        struct tm *t = localtime(&std_time);
         SYSTEMTIME st;
         ZeroMemory(&st, sizeof(st));
-        st.wYear = tm_info->tm_year + 1900;
-        st.wMonth = tm_info->tm_mon + 1;
-        st.wDay = tm_info->tm_mday;
-        st.wHour = tm_info->tm_hour;
-        st.wMinute = tm_info->tm_min;
-        st.wSecond = tm_info->tm_sec;
-        st.wMilliseconds = 0;
-
+        st.wYear = t->tm_year + 1900;
+        st.wMonth = t->tm_mon + 1;
+        st.wDay = t->tm_mday;
+        st.wHour = t->tm_hour;
+        st.wMinute = t->tm_min;
+        st.wSecond = t->tm_sec;
         if (!SetLocalTime(&st)) {
-            DWORD err = GetLastError();
-            if (err == ERROR_ACCESS_DENIED) {
-                printf("Error: Access denied!\n");
-                printf("Calibrating system time requires Administrator privileges.\n");
-                printf("Please run Command Prompt as Administrator, then run this tool.\n");
-            } else {
-                printf("Error: Calibration failed, error code: %lu\n", err);
-            }
+            printf("Failed. Need admin privileges.\n");
             return 1;
         }
-
-        printf("Calibration complete! System time updated.\n");
-    } else {
-        printf("\nTip: Use -c flag to auto-calibrate system time (requires admin)\n");
+        printf("Done!\n");
     }
 
     return 0;
