@@ -1,0 +1,24 @@
+name: Build tinyntp
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build with MinGW GCC
+        run: |
+          gcc -O2 -o tinyntp.exe tinyntp.c -lws2_32 -s
+          ls -la tinyntp.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinyntp-windows
+          path: tinyntp.exe
